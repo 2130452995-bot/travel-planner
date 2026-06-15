@@ -13,6 +13,7 @@ const CAT = {
 };
 
 const STORAGE_KEY = "travel_planner_v3";
+const useCloud = typeof window !== "undefined" && !!window.storage;
 
 function uid() { return Math.random().toString(36).slice(2, 9); }
 function parseTime(str) {
@@ -28,21 +29,35 @@ function sortActs(acts) {
   });
 }
 
-// blank trip template
 function blankTrip(name = "新旅行计划") {
   return { id: uid(), name, destination: "", startDate: "", days: [], preActivities: [], mealBudget: 150 };
 }
 
-// ─── Storage ──────────────────────────────────────────────────────────────────
-function loadRoot() {
+// ─── Storage: cloud (window.storage) with localStorage fallback ───────────────
+async function loadRoot() {
+  if (useCloud) {
+    try {
+      const res = await window.storage.get(STORAGE_KEY);
+      return res ? JSON.parse(res.value) : null;
+    } catch { return null; }
+  }
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return null;
-    return JSON.parse(raw);
+    return raw ? JSON.parse(raw) : null;
   } catch { return null; }
 }
+
+let _saveTimer = null;
 function saveRoot(root) {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(root)); } catch {}
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(async () => {
+    const str = JSON.stringify(root);
+    if (useCloud) {
+      try { await window.storage.set(STORAGE_KEY, str); } catch {}
+    } else {
+      try { localStorage.setItem(STORAGE_KEY, str); } catch {}
+    }
+  }, 600);
 }
 
 // ─── Shared styles ────────────────────────────────────────────────────────────
@@ -428,7 +443,7 @@ function SummaryPanel({ expandedDays, preActivities, mealBudget }) {
 }
 
 // ─── Trip List Screen ─────────────────────────────────────────────────────────
-function TripListScreen({ trips, onSelect, onCreate, onDelete, onRename }) {
+function TripListScreen({ trips, onSelect, onCreate, onDelete, onRename, saving = false }) {
   const [renaming, setRenaming] = useState(null); // trip id
   const [renameVal, setRenameVal] = useState("");
   const [confirmDel, setConfirmDel] = useState(null);
@@ -445,11 +460,15 @@ function TripListScreen({ trips, onSelect, onCreate, onDelete, onRename }) {
       <div style={{ background: "linear-gradient(135deg,#4A9BAB,#7BAE8C)", padding: "18px 20px", boxShadow: "0 2px 14px rgba(74,155,171,0.25)" }}>
         <div style={{ maxWidth: 600, margin: "0 auto", display: "flex", alignItems: "center", gap: 12 }}>
           <span style={{ fontSize: 26 }}>🗺️</span>
-          <div>
+          <div style={{ flex: 1 }}>
             <div style={{ fontSize: 20, fontWeight: 800, color: "#fff" }}>旅行规划师</div>
             <div style={{ fontSize: 12, color: "rgba(255,255,255,0.75)" }}>管理你的所有旅行计划</div>
           </div>
+          <div style={{ fontSize: 11, color: "rgba(255,255,255,0.8)", display: "flex", alignItems: "center", gap: 5 }}>
+            {saving ? <><span style={{ width:6, height:6, borderRadius:"50%", background:"#ffe082", display:"inline-block", animation:"pulse 0.8s ease-in-out infinite" }} />同步中</> : <><span style={{ width:6, height:6, borderRadius:"50%", background:"#a5d6a7", display:"inline-block" }} />已同步</>}
+          </div>
         </div>
+        <style>{`@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }`}</style>
       </div>
 
       <div style={{ maxWidth: 600, margin: "0 auto", padding: "24px 16px" }}>
@@ -563,7 +582,7 @@ function TripListScreen({ trips, onSelect, onCreate, onDelete, onRename }) {
 }
 
 // ─── Trip Editor Screen ───────────────────────────────────────────────────────
-function TripEditor({ trip, onUpdate, onBack }) {
+function TripEditor({ trip, onUpdate, onBack, saving = false }) {
   const [activeDay, setActiveDay]   = useState(0);
   const [modal, setModal]           = useState(null);
   const [activeMain, setActiveMain] = useState("days");
@@ -684,6 +703,9 @@ function TripEditor({ trip, onUpdate, onBack }) {
         <div style={{ flex: 1 }}>
           <div style={{ fontSize: 17, fontWeight: 800, color: "#fff" }}>{destination || trip.name}</div>
           {destination && trip.name !== destination && <div style={{ fontSize: 11, color: "rgba(255,255,255,0.75)" }}>{trip.name}</div>}
+        </div>
+        <div style={{ fontSize: 11, color: "rgba(255,255,255,0.85)", display: "flex", alignItems: "center", gap: 5 }}>
+          {saving ? <><span style={{ width:6, height:6, borderRadius:"50%", background:"#ffe082", display:"inline-block", animation:"pulse 0.8s ease-in-out infinite" }} />同步中</> : <><span style={{ width:6, height:6, borderRadius:"50%", background:"#a5d6a7", display:"inline-block" }} />已同步</>}
         </div>
       </div>
 
@@ -876,14 +898,44 @@ function TripEditor({ trip, onUpdate, onBack }) {
 
 // ─── Root App ─────────────────────────────────────────────────────────────────
 export default function App() {
-  const [root, setRoot] = useState(() => {
-    const saved = loadRoot();
-    if (saved && saved.trips) return saved;
-    return { trips: [], activeId: null };
-  });
+  const [root, setRoot] = useState(null);
+  const [loadDone, setLoadDone] = useState(false);
+  const [saving, setSaving] = useState(false);
 
-  // Persist every change
-  useEffect(() => { saveRoot(root); }, [root]);
+  // Async load on mount
+  useEffect(() => {
+    loadRoot().then(saved => {
+      setRoot(saved && saved.trips ? saved : { trips: [], activeId: null });
+      setLoadDone(true);
+    });
+  }, []);
+
+  // Persist on change
+  useEffect(() => {
+    if (!loadDone || root === null) return;
+    setSaving(true);
+    saveRoot(root);
+    const t = setTimeout(() => setSaving(false), 1000);
+    return () => clearTimeout(t);
+  }, [root, loadDone]);
+
+  // Loading screen
+  if (!loadDone) {
+    return (
+      <div style={{
+        minHeight: "100vh", background: "#F4F7F8", display: "flex", flexDirection: "column",
+        alignItems: "center", justifyContent: "center", gap: 16,
+        fontFamily: "'PingFang SC','Microsoft YaHei','Segoe UI',sans-serif",
+      }}>
+        <style>{`@keyframes barslide { 0%{transform:translateX(-200%)} 100%{transform:translateX(400%)} }`}</style>
+        <div style={{ fontSize: 44 }}>🗺️</div>
+        <div style={{ fontSize: 15, color: "#4A9BAB", fontWeight: 600 }}>正在加载旅行计划…</div>
+        <div style={{ width: 160, height: 3, background: "#E0EAEC", borderRadius: 3, overflow: "hidden" }}>
+          <div style={{ width: "50%", height: "100%", background: "linear-gradient(90deg,#4A9BAB,#7BAE8C)", borderRadius: 3, animation: "barslide 1.1s ease-in-out infinite" }} />
+        </div>
+      </div>
+    );
+  }
 
   const { trips, activeId } = root;
   const activeTrip = trips.find(t => t.id === activeId) ?? null;
@@ -911,8 +963,9 @@ export default function App() {
     setRoot(r => ({ ...r, trips: r.trips.map(t => t.id === id ? { ...t, name } : t) }));
   };
 
+  // Saving indicator injected into header via context trick — pass as prop instead
   if (activeTrip) {
-    return <TripEditor trip={activeTrip} onUpdate={updateTrip} onBack={goBack} />;
+    return <TripEditor trip={activeTrip} onUpdate={updateTrip} onBack={goBack} saving={saving} />;
   }
 
   return (
@@ -922,6 +975,7 @@ export default function App() {
       onCreate={createTrip}
       onDelete={deleteTrip}
       onRename={renameTrip}
+      saving={saving}
     />
   );
 }
