@@ -3,13 +3,14 @@ import { useState, useMemo, useEffect, useCallback } from "react";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const CAT = {
-  transport:  { label: "大交通",    icon: "✈️",  color: "#4A9BAB", light: "#E8F4F7", text: "#2A7A8A" },
-  attraction: { label: "景点门票",  icon: "🎫",  color: "#7BAE8C", light: "#EAF4ED", text: "#4E8A62" },
-  food:       { label: "餐饮",      icon: "🍜",  color: "#E8856A", light: "#FDF0EC", text: "#C5593A" },
-  hotel:      { label: "住宿",      icon: "🏨",  color: "#9B7BAE", light: "#F3EDF7", text: "#7A5A8A" },
-  shopping:   { label: "购物",      icon: "🛍️",  color: "#AE9B7B", light: "#F7F3E8", text: "#8A7A4E" },
-  pre:        { label: "出发前费用", icon: "🧳",  color: "#5A8AAE", light: "#E8F0F7", text: "#2A5A7A" },
-  other:      { label: "其他",      icon: "📌",  color: "#8E9BAD", light: "#EEF0F3", text: "#5A6A7A" },
+  transport:       { label: "大交通",    icon: "✈️",  color: "#4A9BAB", light: "#E8F4F7", text: "#2A7A8A" },
+  local_transport: { label: "小交通",    icon: "🚌",  color: "#38A89D", light: "#E4F4F2", text: "#1E7A72" },
+  attraction:      { label: "景点门票",  icon: "🎫",  color: "#7BAE8C", light: "#EAF4ED", text: "#4E8A62" },
+  food:            { label: "餐饮",      icon: "🍜",  color: "#E8856A", light: "#FDF0EC", text: "#C5593A" },
+  hotel:           { label: "住宿",      icon: "🏨",  color: "#9B7BAE", light: "#F3EDF7", text: "#7A5A8A" },
+  shopping:        { label: "购物",      icon: "🛍️",  color: "#AE9B7B", light: "#F7F3E8", text: "#8A7A4E" },
+  pre:             { label: "出发前费用", icon: "🧳",  color: "#5A8AAE", light: "#E8F0F7", text: "#2A5A7A" },
+  other:           { label: "其他",      icon: "📌",  color: "#8E9BAD", light: "#EEF0F3", text: "#5A6A7A" },
 };
 
 const STORAGE_KEY = "travel_planner_v3";
@@ -30,7 +31,13 @@ function sortActs(acts) {
 }
 
 function blankTrip(name = "新旅行计划") {
-  return { id: uid(), name, destination: "", startDate: "", days: [], preActivities: [], mealBudget: 150 };
+  return { id: uid(), name, destination: "", startDate: "", days: [], preActivities: [], mealBudget: 150, mealBudgets: {} };
+}
+
+// Get per-day meal budget: falls back to global default
+function getDayMeal(trip, dayIdx) {
+  if (trip.mealBudgets && trip.mealBudgets[dayIdx] !== undefined) return trip.mealBudgets[dayIdx];
+  return trip.mealBudget ?? 150;
 }
 
 // ─── Storage: cloud (window.storage) with localStorage fallback ───────────────
@@ -405,8 +412,8 @@ function TimelineView({ dayActivities, mealBudget, onEdit, onDelete }) {
 }
 
 // ─── Summary Panel ────────────────────────────────────────────────────────────
-function SummaryPanel({ expandedDays, preActivities, mealBudget }) {
-  const totalMeal = mealBudget * expandedDays.length;
+function SummaryPanel({ expandedDays, preActivities, trip }) {
+  const totalMeal = expandedDays.reduce((s, _, i) => s + getDayMeal(trip, i), 0);
   const byCat = {};
   expandedDays.forEach(d => d.activities.forEach(a => {
     byCat[a.category] = (byCat[a.category] || 0) + (a._displayCost || 0);
@@ -589,6 +596,7 @@ function TripEditor({ trip, onUpdate, onBack, saving = false }) {
   const [rightPanel, setRightPanel] = useState("itinerary");
 
   const { destination, startDate, days, preActivities, mealBudget } = trip;
+  const mealBudgets = trip.mealBudgets || {};
 
   const setField = (k, v) => onUpdate({ ...trip, [k]: v });
 
@@ -609,22 +617,32 @@ function TripEditor({ trip, onUpdate, onBack, saving = false }) {
     setActiveDay(a => Math.max(0, a >= idx ? a - 1 : a));
   };
 
-  const expandedDays = useMemo(() => days.map((d, di) => {
-    const allHotels = days.flatMap(dd => dd.activities.filter(a => a.category === "hotel"));
-    const direct = d.activities
-      .filter(a => a.category !== "hotel")
-      .filter(a => !a.multiDay || (a.dayFrom <= di && a.dayTo >= di))
-      .map(a => {
-        if (!a.multiDay) return { ...a, _displayCost: a.cost || 0 };
-        const span = Math.max(1, a.dayTo - a.dayFrom + 1);
-        const perDay = a.costMode === "perday" ? (a.cost || 0) : (a.cost || 0) / span;
-        return { ...a, _displayCost: Math.round(perDay * 100) / 100, _costNote: a.costMode === "perday" ? "/天" : `(总¥${a.cost}平摊)` };
-      });
-    const hotelSlices = allHotels
-      .filter(h => h.dayFrom <= di && h.dayTo >= di)
-      .map(h => ({ ...h, timeType: "allday", _displayCost: h.hotelNightCost || 0, _costNote: "/晚", _injected: true }));
-    return { ...d, activities: [...direct, ...hotelSlices] };
-  }), [days]);
+  const expandedDays = useMemo(() => {
+    // Collect ALL activities across all days (hotels stored on dayFrom, multi-day too)
+    const allActs = days.flatMap(d => d.activities);
+    return days.map((d, di) => {
+      // Single-day non-hotel acts that belong to this day
+      const singleDay = d.activities
+        .filter(a => a.category !== "hotel" && !a.multiDay)
+        .map(a => ({ ...a, _displayCost: a.cost || 0 }));
+
+      // Multi-day acts (stored on dayFrom) that cover this day
+      const multiDaySlices = allActs
+        .filter(a => a.category !== "hotel" && a.multiDay && a.dayFrom <= di && a.dayTo >= di)
+        .map(a => {
+          const span = Math.max(1, a.dayTo - a.dayFrom + 1);
+          const perDay = a.costMode === "perday" ? (a.cost || 0) : (a.cost || 0) / span;
+          return { ...a, _displayCost: Math.round(perDay * 100) / 100, _costNote: a.costMode === "perday" ? "/天" : `(总¥${a.cost}平摊)` };
+        });
+
+      // Hotel slices for this day
+      const hotelSlices = allActs
+        .filter(a => a.category === "hotel" && a.dayFrom <= di && a.dayTo >= di)
+        .map(h => ({ ...h, timeType: "allday", _displayCost: h.hotelNightCost || 0, _costNote: "/晚", _injected: true }));
+
+      return { ...d, activities: [...singleDay, ...multiDaySlices, ...hotelSlices] };
+    });
+  }, [days]);
 
   const saveActivity = (act) => {
     if (act.category === "pre") {
@@ -663,37 +681,43 @@ function TripEditor({ trip, onUpdate, onBack, saving = false }) {
 
   const dayCost = (di) => {
     const exp = expandedDays[di];
-    if (!exp) return mealBudget;
-    return exp.activities.reduce((s, a) => s + (a._displayCost || 0), 0) + mealBudget;
+    const meal = getDayMeal(trip, di);
+    if (!exp) return meal;
+    return exp.activities.reduce((s, a) => s + (a._displayCost || 0), 0) + meal;
   };
 
   const currentExpDay = expandedDays[activeDay] ?? { activities: [] };
 
   const SummaryContent = () => (
-    <>
-      <SummaryPanel expandedDays={expandedDays} preActivities={preActivities} mealBudget={mealBudget} />
-      {days.length > 1 && (
-        <div style={{ background: "#fff", borderRadius: 14, padding: 14, marginTop: 12, boxShadow: "0 2px 10px rgba(0,0,0,0.05)" }}>
+    <div style={{ background: "#fff", borderRadius: 14, padding: "16px 18px", boxShadow: "0 2px 10px rgba(0,0,0,0.05)" }}>
+      <SummaryPanel expandedDays={expandedDays} preActivities={preActivities} trip={trip} />
+      {days.length > 0 && (
+        <div style={{ marginTop: 16 }}>
           <div style={{ fontSize: 11, fontWeight: 700, color: "#8E9BAD", marginBottom: 8 }}>各天花销</div>
           {days.map((_, i) => (
             <div key={i} onClick={() => { setActiveDay(i); setActiveMain("days"); setRightPanel("itinerary"); }} style={{
               display: "flex", justifyContent: "space-between", alignItems: "center",
-              padding: "5px 8px", borderRadius: 8, cursor: "pointer",
-              background: i === activeDay && activeMain === "days" ? "#E8F4F7" : "transparent", marginBottom: 2,
+              padding: "7px 10px", borderRadius: 9, cursor: "pointer",
+              background: i === activeDay && activeMain === "days" && rightPanel !== "summary" ? "#E8F4F7" : "transparent", marginBottom: 2,
             }}>
-              <span style={{ fontSize: 12, color: i === activeDay && activeMain === "days" ? "#2A7A8A" : "#5A6A7A" }}>{dayDate(i)}</span>
-              <span style={{ fontSize: 12, fontWeight: 600, color: i === activeDay && activeMain === "days" ? "#4A9BAB" : "#8E9BAD" }}>¥{dayCost(i).toLocaleString()}</span>
+              <span style={{ fontSize: 13, color: i === activeDay && activeMain === "days" && rightPanel !== "summary" ? "#2A7A8A" : "#5A6A7A" }}>{dayDate(i)}</span>
+              <div style={{ textAlign: "right" }}>
+                <span style={{ fontSize: 13, fontWeight: 600, color: i === activeDay && activeMain === "days" && rightPanel !== "summary" ? "#4A9BAB" : "#8E9BAD" }}>¥{dayCost(i).toLocaleString()}</span>
+                <span style={{ fontSize: 10, color: "#ccc", marginLeft: 4 }}>(含餐¥{getDayMeal(trip,i)})</span>
+              </div>
             </div>
           ))}
+          <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid #F0F4F7", display: "flex", justifyContent: "space-between", fontSize: 13 }}>
+            <span style={{ color: "#8E9BAD" }}>合计</span>
+            <span style={{ fontWeight: 700, color: "#4A9BAB" }}>¥{days.reduce((s,_,i) => s + dayCost(i), 0).toLocaleString()}</span>
+          </div>
         </div>
       )}
-    </>
+    </div>
   );
 
   return (
     <div style={{ minHeight: "100vh", background: "#F4F7F8", fontFamily: "'PingFang SC','Microsoft YaHei','Segoe UI',sans-serif", color: "#2C3E50" }}>
-      <style>{`@media (min-width: 680px) { .planner-grid { grid-template-columns: 1fr 260px !important; } }`}</style>
-
       {/* Header */}
       <div style={{ background: "linear-gradient(135deg,#4A9BAB,#7BAE8C)", padding: "13px 18px", display: "flex", alignItems: "center", gap: 12, boxShadow: "0 2px 14px rgba(74,155,171,0.25)" }}>
         <button onClick={onBack} style={{
@@ -717,14 +741,14 @@ function TripEditor({ trip, onUpdate, onBack, saving = false }) {
         }}>
           <input value={destination} onChange={e => setField("destination", e.target.value)}
             placeholder="目的地（如：京都、巴黎…）"
-            style={{ ...inputStyle, flex: "2 1 130px", width: "auto" }} />
-          <div style={{ display: "flex", alignItems: "center", gap: 6, flex: "1 1 120px" }}>
+            style={{ ...inputStyle, flex: "2 1 140px", width: "auto" }} />
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flex: "1 1 130px" }}>
             <span style={{ fontSize: 12, color: "#8E9BAD", whiteSpace: "nowrap" }}>出发</span>
             <input type="date" value={startDate} onChange={e => setField("startDate", e.target.value)}
               style={{ ...inputStyle, flex: 1, width: "auto" }} />
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 5, flex: "0 1 160px" }}>
-            <span style={{ fontSize: 12, color: "#E8856A", whiteSpace: "nowrap" }}>🍜 每日餐饮</span>
+          <div style={{ display: "flex", alignItems: "center", gap: 5, flex: "0 1 190px" }}>
+            <span style={{ fontSize: 12, color: "#E8856A", whiteSpace: "nowrap" }}>🍜 默认餐饮预算</span>
             <NumInput value={mealBudget} onChange={v => setField("mealBudget", v)} style={{ width: 58, flex: "none" }} />
             <span style={{ fontSize: 12, color: "#8E9BAD" }}>¥</span>
           </div>
@@ -851,24 +875,50 @@ function TripEditor({ trip, onUpdate, onBack, saving = false }) {
                   <div style={{
                     background: "#fff", borderRadius: 14, padding: "12px 16px", marginBottom: 10,
                     boxShadow: "0 2px 10px rgba(0,0,0,0.05)",
-                    display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8,
                   }}>
-                    <div>
-                      <div style={{ fontSize: 15, fontWeight: 700 }}>{dayDate(activeDay)}</div>
-                      <div style={{ fontSize: 12, color: "#8E9BAD", marginTop: 3 }}>
-                        今日预计：<span style={{ color: "#4A9BAB", fontWeight: 700 }}>¥{dayCost(activeDay).toLocaleString()}</span>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
+                      <div>
+                        <div style={{ fontSize: 15, fontWeight: 700 }}>{dayDate(activeDay)}</div>
+                        <div style={{ fontSize: 12, color: "#8E9BAD", marginTop: 3 }}>
+                          今日预计：<span style={{ color: "#4A9BAB", fontWeight: 700 }}>¥{dayCost(activeDay).toLocaleString()}</span>
+                        </div>
                       </div>
+                      <button onClick={() => setModal({ act: null, dayIdx: activeDay, isPre: false })} style={{
+                        padding: "7px 14px", borderRadius: 10, border: "none",
+                        background: "linear-gradient(135deg,#4A9BAB,#7BAE8C)",
+                        color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer",
+                      }}>+ 添加行程</button>
                     </div>
-                    <button onClick={() => setModal({ act: null, dayIdx: activeDay, isPre: false })} style={{
-                      padding: "7px 14px", borderRadius: 10, border: "none",
-                      background: "linear-gradient(135deg,#4A9BAB,#7BAE8C)",
-                      color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer",
-                    }}>+ 添加行程</button>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, paddingTop: 8, borderTop: "1px solid #F0F4F7" }}>
+                      <span style={{ fontSize: 12, color: "#E8856A", whiteSpace: "nowrap" }}>🍜 今日餐饮</span>
+                      <NumInput
+                        value={getDayMeal(trip, activeDay)}
+                        onChange={v => {
+                          const budgets = { ...(trip.mealBudgets || {}) };
+                          budgets[activeDay] = v;
+                          onUpdate({ ...trip, mealBudgets: budgets });
+                        }}
+                        style={{ width: 70, flex: "none" }}
+                      />
+                      <span style={{ fontSize: 12, color: "#8E9BAD" }}>¥</span>
+                      {(trip.mealBudgets?.[activeDay] !== undefined) && (
+                        <button
+                          onClick={() => {
+                            const budgets = { ...(trip.mealBudgets || {}) };
+                            delete budgets[activeDay];
+                            onUpdate({ ...trip, mealBudgets: budgets });
+                          }}
+                          style={{ fontSize: 11, color: "#bbb", background: "none", border: "none", cursor: "pointer", padding: "2px 6px" }}
+                        >
+                          重置为默认(¥{trip.mealBudget})
+                        </button>
+                      )}
+                    </div>
                   </div>
                   <div style={{ background: "#fff", borderRadius: 14, padding: "16px 18px", boxShadow: "0 2px 10px rgba(0,0,0,0.05)", minHeight: 160 }}>
                     <TimelineView
                       dayActivities={currentExpDay.activities}
-                      mealBudget={mealBudget}
+                      mealBudget={getDayMeal(trip, activeDay)}
                       onEdit={openEdit}
                       onDelete={(id) => deleteActivity(id, false)}
                     />
@@ -877,8 +927,7 @@ function TripEditor({ trip, onUpdate, onBack, saving = false }) {
               )}
             </div>
 
-            {/* Right (desktop) */}
-            <div><SummaryContent /></div>
+            {/* Right col removed — summary is in its own tab */}
           </div>
         )}
       </div>
