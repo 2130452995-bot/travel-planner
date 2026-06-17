@@ -1,5 +1,5 @@
 "use client";
-import { useState, useMemo, useEffect, useCallback } from "react";
+import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const CAT = {
@@ -22,11 +22,21 @@ function parseTime(str) {
   const [h, m] = str.split(":").map(Number);
   return h * 60 + (m || 0);
 }
+const APPROX_SLOT_ORDER = { morning: 0, afternoon: 1, evening: 2 };
+const APPROX_SLOT_LABEL = { morning: "上午", afternoon: "下午", evening: "晚上" };
+const APPROX_SLOT_TIME  = { morning: "09:00", afternoon: "13:00", evening: "19:00" };
+
+function actSortKey(a) {
+  if (a.timeType === "allday") return 9999;
+  if (a.timeType === "approximate") return (APPROX_SLOT_ORDER[a.approxSlot] ?? 1) * 100 + 50;
+  return parseTime(a.time) ?? 0;
+}
 function sortActs(acts) {
   return [...acts].sort((a, b) => {
-    if (a.timeType === "allday" && b.timeType !== "allday") return 1;
-    if (a.timeType !== "allday" && b.timeType === "allday") return -1;
-    return (parseTime(a.time) ?? 0) - (parseTime(b.time) ?? 0);
+    const ka = actSortKey(a), kb = actSortKey(b);
+    if (ka !== kb) return ka - kb;
+    // Same time bucket: respect manual sortOrder
+    return (a.sortOrder ?? 0) - (b.sortOrder ?? 0);
   });
 }
 
@@ -126,7 +136,7 @@ function NumInput({ value, onChange, style = {} }) {
 // ─── Activity Modal ───────────────────────────────────────────────────────────
 const blankForm = (dayIdx) => ({
   id: uid(), title: "", category: "transport", timeType: "exact",
-  time: "", note: "", cost: 0,
+  time: "", approxSlot: "morning", note: "", cost: 0,
   multiDay: false, dayFrom: dayIdx, dayTo: dayIdx,
   costMode: "total", hotelNightCost: 0,
 });
@@ -223,9 +233,23 @@ function ActivityModal({ initial, dayIdx, totalDays, onSave, onClose }) {
                 ))}
               </div>
             </Field>
-            {form.timeType !== "allday" && (
+            {form.timeType === "exact" && (
               <Field label="时间">
                 <input type="time" value={form.time} onChange={e => set("time", e.target.value)} style={inputStyle} />
+              </Field>
+            )}
+            {form.timeType === "approximate" && (
+              <Field label="大约时段">
+                <div style={{ display: "flex", gap: 6 }}>
+                  {[["morning","🌅 上午"],["afternoon","☀️ 下午"],["evening","🌙 晚上"]].map(([k, v]) => (
+                    <button key={k} onClick={() => set("approxSlot", k)} style={{
+                      flex: 1, padding: "7px 0", borderRadius: 10, fontSize: 13, cursor: "pointer",
+                      border: "1.5px solid #4A9BAB",
+                      background: form.approxSlot === k ? "#4A9BAB" : "#E8F4F7",
+                      color: form.approxSlot === k ? "#fff" : "#2A7A8A", fontWeight: 600,
+                    }}>{v}</button>
+                  ))}
+                </div>
               </Field>
             )}
             <Field label="跨越多天">
@@ -294,12 +318,109 @@ function ActivityModal({ initial, dayIdx, totalDays, onSave, onClose }) {
 }
 
 // ─── Timeline View ────────────────────────────────────────────────────────────
-function TimelineView({ dayActivities, mealBudget, onEdit, onDelete }) {
+function ActivityCard({ act, onEdit, onDelete, dragHandleProps = {}, isDragging = false }) {
+  const c = CAT[act.category] ?? CAT.other;
+  return (
+    <div style={{
+      background: isDragging ? "#F0F8FA" : "#fff",
+      borderRadius: 10, border: `1px solid ${c.color}35`,
+      boxShadow: isDragging ? "0 4px 18px rgba(74,155,171,0.18)" : "0 1px 5px rgba(0,0,0,0.04)",
+      overflow: "hidden", opacity: isDragging ? 0.92 : 1,
+      transition: "box-shadow 0.15s",
+    }}>
+      <div style={{ height: 2, background: c.color }} />
+      <div style={{ padding: "8px 10px", display: "flex", gap: 8, alignItems: "center" }}>
+        <div {...dragHandleProps} style={{
+          cursor: "grab", color: "#ccc", fontSize: 14, lineHeight: 1,
+          padding: "2px 2px", flexShrink: 0, touchAction: "none",
+          userSelect: "none",
+        }}>⠿</div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}>
+            <span style={{ fontWeight: 600, fontSize: 13, color: "#2C3E50" }}>{act.title}</span>
+            <Tag cat={act.category} />
+          </div>
+          {act.note && <div style={{ fontSize: 11, color: "#9AA8B5", marginTop: 1 }}>{act.note}</div>}
+          {act._displayCost > 0 && (
+            <div style={{ fontSize: 11, color: c.text, fontWeight: 500, marginTop: 1 }}>
+              ¥{act._displayCost.toLocaleString()}
+              {act._costNote && <span style={{ color: "#bbb", fontWeight: 400 }}> {act._costNote}</span>}
+            </div>
+          )}
+        </div>
+        <div style={{ display: "flex", gap: 3, flexShrink: 0 }}>
+          <button onClick={() => onEdit(act)} style={iconBtnStyle("#4A9BAB")}>✏️</button>
+          <button onClick={() => onDelete(act.id)} style={iconBtnStyle("#E8856A")}>🗑️</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TimelineView({ dayActivities, mealBudget, onEdit, onDelete, onReorder }) {
+  const [dragging, setDragging] = useState(null);   // { id, section }
+  const [dragOver, setDragOver] = useState(null);   // { id, section }
+  const dragNode = useRef(null);
+
   const sorted = sortActs(dayActivities);
   const timed  = sorted.filter(a => a.timeType !== "allday");
   const allday = sorted.filter(a => a.timeType === "allday");
   const hasAny = timed.length > 0 || allday.length > 0 || mealBudget > 0;
 
+  // Time label for an activity
+  const timeLabel = (act) => {
+    if (act.timeType === "approximate") return APPROX_SLOT_LABEL[act.approxSlot] ?? "约";
+    return act.time || "--:--";
+  };
+  const timeLabelSmall = (act) => act.timeType === "approximate";
+
+  // Drag helpers — work with both timed and allday sections separately
+  const handleDragStart = (e, act, section) => {
+    setDragging({ id: act.id, section });
+    dragNode.current = e.currentTarget;
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", act.id);
+    setTimeout(() => { if (dragNode.current) dragNode.current.style.opacity = "0.4"; }, 0);
+  };
+  const handleDragEnd = (e) => {
+    if (dragNode.current) dragNode.current.style.opacity = "1";
+    dragNode.current = null;
+    if (dragging && dragOver && dragging.id !== dragOver.id && dragging.section === dragOver.section) {
+      onReorder(dragging.id, dragOver.id, dragging.section);
+    }
+    setDragging(null);
+    setDragOver(null);
+  };
+  const handleDragOver = (e, act, section) => {
+    e.preventDefault();
+    if (dragging && dragging.section === section) setDragOver({ id: act.id, section });
+  };
+
+  const renderAct = (act, section) => (
+    <div
+      key={act.id}
+      draggable
+      onDragStart={e => handleDragStart(e, act, section)}
+      onDragEnd={handleDragEnd}
+      onDragOver={e => handleDragOver(e, act, section)}
+      onDrop={e => { e.preventDefault(); }}
+      style={{
+        marginBottom: 7,
+        outline: dragOver?.id === act.id ? "2px dashed #4A9BAB" : "none",
+        borderRadius: 10,
+      }}
+    >
+      <ActivityCard
+        act={act}
+        onEdit={onEdit}
+        onDelete={onDelete}
+        isDragging={dragging?.id === act.id}
+      />
+    </div>
+  );
+
+  // Group timed acts by time label for visual clarity
+  // Show a slim left-rail with time badges
   return (
     <div>
       {!hasAny && (
@@ -309,99 +430,63 @@ function TimelineView({ dayActivities, mealBudget, onEdit, onDelete }) {
       )}
 
       {timed.length > 0 && (
-        <div style={{ position: "relative", paddingLeft: 68 }}>
-          <div style={{
-            position: "absolute", left: 52, top: 6, bottom: 6, width: 2, borderRadius: 2,
-            background: "linear-gradient(to bottom, #4A9BAB55, #7BAE8C33)",
-          }} />
-          {timed.map((act) => {
-            const c = CAT[act.category] ?? CAT.other;
-            return (
-              <div key={act.id} style={{ position: "relative" }}>
-                <div style={{ position: "absolute", left: -68, width: 46, textAlign: "right", top: 12 }}>
-                  <span style={{ fontSize: 12, fontWeight: 700, color: c.text, display: "block" }}>{act.time || "--:--"}</span>
-                  {act.timeType === "approximate" && <span style={{ fontSize: 10, color: "#bbb" }}>约</span>}
-                </div>
-                <div style={{
-                  position: "absolute", left: -20, top: 14,
-                  width: 10, height: 10, borderRadius: "50%",
-                  background: c.color, boxShadow: `0 0 0 3px ${c.color}25`,
-                }} />
-                <div style={{
-                  marginBottom: 10, background: "#fff", borderRadius: 12,
-                  border: `1px solid ${c.color}35`, boxShadow: "0 1px 8px rgba(0,0,0,0.05)", overflow: "hidden",
-                }}>
-                  <div style={{ height: 3, background: c.color }} />
-                  <div style={{ padding: "10px 14px", display: "flex", gap: 10, alignItems: "flex-start" }}>
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", marginBottom: 2 }}>
-                        <span style={{ fontWeight: 600, fontSize: 14, color: "#2C3E50" }}>{act.title}</span>
-                        <Tag cat={act.category} />
-                      </div>
-                      {act.note && <div style={{ fontSize: 12, color: "#9AA8B5", marginBottom: 2 }}>{act.note}</div>}
-                      {act._displayCost > 0 && (
-                        <div style={{ fontSize: 12, color: c.text, fontWeight: 500 }}>
-                          ¥{act._displayCost.toLocaleString()}
-                          {act._costNote && <span style={{ color: "#bbb", fontWeight: 400 }}> {act._costNote}</span>}
-                        </div>
-                      )}
-                    </div>
-                    <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
-                      <button onClick={() => onEdit(act)} style={iconBtnStyle("#4A9BAB")}>✏️</button>
-                      <button onClick={() => onDelete(act.id)} style={iconBtnStyle("#E8856A")}>🗑️</button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
-
-      {(allday.length > 0 || mealBudget > 0) && (
-        <div style={{ marginTop: timed.length > 0 ? 14 : 0 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-            <div style={{ flex: 1, height: 1, background: "#EBEBEB" }} />
-            <span style={{ fontSize: 11, color: "#bbb", fontWeight: 600, whiteSpace: "nowrap" }}>全天安排</span>
-            <div style={{ flex: 1, height: 1, background: "#EBEBEB" }} />
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
-            {allday.map(act => {
+        <div style={{ display: "flex", gap: 0 }}>
+          {/* Slim time rail */}
+          <div style={{ width: 44, flexShrink: 0, position: "relative" }}>
+            {/* vertical line */}
+            <div style={{
+              position: "absolute", left: 21, top: 14, bottom: 14, width: 2,
+              background: "linear-gradient(to bottom,#4A9BAB44,#7BAE8C22)", borderRadius: 2,
+            }} />
+            {timed.map((act) => {
               const c = CAT[act.category] ?? CAT.other;
+              const isApprox = act.timeType === "approximate";
               return (
-                <div key={act.id} style={{
-                  background: "#FAFAFA", borderRadius: 10, padding: "9px 12px",
-                  border: "1px solid #E8E8E8", display: "flex", alignItems: "center", gap: 10,
-                }}>
-                  <div style={{ width: 3, height: 32, borderRadius: 2, background: c.color, flexShrink: 0 }} />
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-                      <span style={{ fontWeight: 600, fontSize: 13, color: "#2C3E50" }}>{act.title}</span>
-                      <Tag cat={act.category} />
-                    </div>
-                    {act.note && <div style={{ fontSize: 11, color: "#9AA8B5" }}>{act.note}</div>}
-                    {act._displayCost > 0 && (
-                      <div style={{ fontSize: 11, color: c.text, fontWeight: 500 }}>
-                        ¥{act._displayCost.toLocaleString()}
-                        {act._costNote && <span style={{ color: "#bbb", fontWeight: 400 }}> {act._costNote}</span>}
-                      </div>
-                    )}
-                  </div>
-                  <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
-                    <button onClick={() => onEdit(act)} style={iconBtnStyle("#4A9BAB")}>✏️</button>
-                    <button onClick={() => onDelete(act.id)} style={iconBtnStyle("#E8856A")}>🗑️</button>
+                <div key={act.id} style={{ height: 52, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", position: "relative" }}>
+                  {/* dot */}
+                  <div style={{
+                    width: isApprox ? 8 : 10, height: isApprox ? 8 : 10, borderRadius: "50%", zIndex: 1,
+                    background: isApprox ? "#fff" : c.color,
+                    border: `2px solid ${c.color}`,
+                    boxShadow: isApprox ? "none" : `0 0 0 3px ${c.color}22`,
+                  }} />
+                  {/* time badge */}
+                  <div style={{
+                    fontSize: isApprox ? 10 : 10, fontWeight: 700,
+                    color: isApprox ? "#8E9BAD" : c.text,
+                    textAlign: "center", lineHeight: 1.2, marginTop: 2,
+                    whiteSpace: "nowrap",
+                  }}>
+                    {timeLabel(act)}
                   </div>
                 </div>
               );
             })}
+          </div>
+          {/* Cards */}
+          <div style={{ flex: 1, minWidth: 0, paddingTop: 6 }}>
+            {timed.map(act => renderAct(act, "timed"))}
+          </div>
+        </div>
+      )}
+
+      {(allday.length > 0 || mealBudget > 0) && (
+        <div style={{ marginTop: timed.length > 0 ? 10 : 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 7 }}>
+            <div style={{ flex: 1, height: 1, background: "#EBEBEB" }} />
+            <span style={{ fontSize: 10, color: "#bbb", fontWeight: 600, whiteSpace: "nowrap" }}>全天安排</span>
+            <div style={{ flex: 1, height: 1, background: "#EBEBEB" }} />
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+            {allday.map(act => renderAct(act, "allday"))}
             {mealBudget > 0 && (
               <div style={{
-                background: "#FDF0EC", borderRadius: 10, padding: "9px 12px",
-                border: "1px solid #E8856A30", display: "flex", alignItems: "center", gap: 10,
+                background: "#FDF0EC", borderRadius: 10, padding: "8px 10px",
+                border: "1px solid #E8856A30", display: "flex", alignItems: "center", gap: 8,
               }}>
-                <div style={{ width: 3, height: 28, borderRadius: 2, background: "#E8856A", flexShrink: 0 }} />
+                <div style={{ width: 3, height: 24, borderRadius: 2, background: "#E8856A", flexShrink: 0 }} />
                 <span style={{ fontSize: 13, color: "#C5593A", flex: 1 }}>🍜 餐饮预算</span>
-                <span style={{ fontSize: 13, color: "#C5593A", fontWeight: 700 }}>¥{mealBudget.toLocaleString()}</span>
+                <span style={{ fontSize: 12, color: "#C5593A", fontWeight: 700 }}>¥{mealBudget.toLocaleString()}</span>
               </div>
             )}
           </div>
@@ -670,6 +755,55 @@ function TripEditor({ trip, onUpdate, onBack, saving = false }) {
     }
   };
 
+  // Reorder activities within a day by drag-drop
+  // We reorder by inserting dragId before overId in the sorted display order,
+  // then persisting a manual `order` index so sortActs respects it for same-slot items.
+  const reorderActivity = (dayIdx, dragId, overId, section) => {
+    const day = days[dayIdx];
+    if (!day) return;
+
+    // Get the current display order for this section
+    const allActs = days.flatMap(d => d.activities);
+    const getDisplayActs = (di) => {
+      const singleDay = days[di].activities
+        .filter(a => a.category !== "hotel" && !a.multiDay)
+        .map(a => ({ ...a, _displayCost: a.cost || 0 }));
+      const multiDaySlices = allActs
+        .filter(a => a.category !== "hotel" && a.multiDay && a.dayFrom <= di && a.dayTo >= di)
+        .map(a => ({ ...a, _displayCost: 0 }));
+      const hotelSlices = allActs
+        .filter(a => a.category === "hotel" && a.dayFrom <= di && a.dayTo >= di)
+        .map(h => ({ ...h, timeType: "allday", _displayCost: 0 }));
+      return sortActs([...singleDay, ...multiDaySlices, ...hotelSlices]);
+    };
+
+    const displayed = getDisplayActs(dayIdx);
+    const sectionActs = displayed.filter(a => section === "allday" ? a.timeType === "allday" : a.timeType !== "allday");
+
+    const fromIdx = sectionActs.findIndex(a => a.id === dragId);
+    const toIdx   = sectionActs.findIndex(a => a.id === overId);
+    if (fromIdx < 0 || toIdx < 0 || fromIdx === toIdx) return;
+
+    // Build new ordered list
+    const reordered = [...sectionActs];
+    const [moved] = reordered.splice(fromIdx, 1);
+    reordered.splice(toIdx, 0, moved);
+
+    // Assign sortOrder values, then update the canonical activities in their home days
+    const orderMap = {};
+    reordered.forEach((a, i) => { orderMap[a.id] = i; });
+
+    onUpdate({
+      ...trip,
+      days: days.map(d => ({
+        ...d,
+        activities: d.activities.map(a =>
+          orderMap[a.id] !== undefined ? { ...a, sortOrder: orderMap[a.id] } : a
+        ),
+      })),
+    });
+  };
+
   const openEdit = (act) => {
     const isPre = act.category === "pre";
     const home = isPre ? 0 : (act.category === "hotel" || act.multiDay) ? act.dayFrom : activeDay;
@@ -921,6 +1055,7 @@ function TripEditor({ trip, onUpdate, onBack, saving = false }) {
                       mealBudget={getDayMeal(trip, activeDay)}
                       onEdit={openEdit}
                       onDelete={(id) => deleteActivity(id, false)}
+                      onReorder={(dragId, overId, section) => reorderActivity(activeDay, dragId, overId, section)}
                     />
                   </div>
                 </div>
